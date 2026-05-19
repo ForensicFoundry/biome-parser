@@ -1,0 +1,9 @@
+[project]
+name = "biome-parser"
+version = "2026.05.01"
+description = "Apple Biome SEGB stream parser"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ccl-segb @ git+https://github.com/cclgroupltd/ccl-segb.git",
+]

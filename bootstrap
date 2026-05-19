@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Purpose: Run uv sync and update a target script shebang to use this project's venv Python.
+
+set -euo pipefail
+
+VERSION="2026.05.01"
+TARGET_SCRIPT="./biome-parser"
+
+if [[ -t 1 ]]; then
+  C_BLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'
+  C_BLU=$'\033[34m'
+  C_CYN=$'\033[36m'
+  C_RST=$'\033[0m'
+else
+  C_BLD=""
+  C_DIM=""
+  C_RED=""
+  C_GRN=""
+  C_YEL=""
+  C_BLU=""
+  C_CYN=""
+  C_RST=""
+fi
+
+SCRIPT_SELF="$(basename "$0")"
+
+usage() {
+  cat <<EOF
+${C_BLD}Usage:${C_RST}
+  $SCRIPT_SELF [options]
+
+${C_BLD}Purpose:${C_RST}
+  Verify pyproject.toml exists in the current directory, run uv sync,
+  and update the first line of TARGET_SCRIPT to use .venv/bin/python3.
+
+${C_BLD}Configured target:${C_RST}
+  TARGET_SCRIPT=$TARGET_SCRIPT
+
+${C_BLD}Options:${C_RST}
+  -h, --help      Show this help message
+  -v, --version   Show version
+EOF
+}
+
+note() {
+  printf '%s==>%s %s\n' "$C_BLU" "$C_RST" "$*"
+}
+
+ok() {
+  printf '  %sOK:%s %s\n' "$C_GRN" "$C_RST" "$*"
+}
+
+warn() {
+  printf '  %sWARN:%s %s\n' "$C_YEL" "$C_RST" "$*"
+}
+
+err() {
+  printf '  %sERROR:%s %s\n' "$C_RED" "$C_RST" "$*" >&2
+}
+
+header() {
+  printf '\n  %sSummary [%s v%s]%s\n' "$C_BLD" "$SCRIPT_SELF" "$VERSION" "$C_RST"
+  printf '  ----------------------------------------\n'
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  -v|--version)
+    printf '%s v%s\n' "$SCRIPT_SELF" "$VERSION"
+    exit 0
+    ;;
+  "")
+    ;;
+  *)
+    err "Unknown option: $1"
+    printf '\n'
+    usage
+    exit 2
+    ;;
+esac
+
+header
+
+if [[ ! -f "pyproject.toml" ]]; then
+  err "No pyproject.toml found in the current directory: $(pwd)"
+  err "Run this from the root of the Python project."
+  exit 1
+fi
+
+ok "Found pyproject.toml"
+
+if ! command -v uv >/dev/null 2>&1; then
+  err "uv is not installed or is not in PATH."
+  exit 1
+fi
+
+ok "Found uv: $(command -v uv)"
+
+if [[ ! -f "$TARGET_SCRIPT" ]]; then
+  err "Target script does not exist: $TARGET_SCRIPT"
+  err "Edit TARGET_SCRIPT near the top of this script."
+  exit 1
+fi
+
+ok "Found target script: $TARGET_SCRIPT"
+
+note "Running: uv sync"
+uv sync
+ok "uv sync completed"
+
+VENV_PYTHON="$(pwd)/.venv/bin/python3"
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+  err "Expected venv Python was not found or is not executable: $VENV_PYTHON"
+  exit 1
+fi
+
+ok "Found venv Python: $VENV_PYTHON"
+
+note "Updating shebang in: $TARGET_SCRIPT"
+sed -i "1c$(printf '#!%s' "$VENV_PYTHON")" "$TARGET_SCRIPT"
+
+ok "Updated first line to: #!$VENV_PYTHON"

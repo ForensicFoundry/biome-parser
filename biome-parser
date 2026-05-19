@@ -1,0 +1,1086 @@
+#!
+"""
+biome-parser
+
+Best-effort parser for Apple Biome SEGB stream files.
+
+This keeps the low-level SEGB record dumping and adds:
+
+    - interval summary output for app usage, app focus, and Wi-Fi state
+    - Wi-Fi semantic event time fallback to the SEGB record timestamp
+
+It also keeps schema-less protobuf wire decoding plus targeted semantic
+extraction for high-value pattern-of-life streams observed on current macOS systems:
+
+    restricted/App.InFocus
+    restricted/ScreenTime.AppUsage
+
+Important limitation:
+    This is not an Apple-schema-aware parser. Apple does not publish the
+    private protobuf schemas for Biome streams. The stream-specific fields
+    below are inferred from record structure I've observed and should be
+    validated against corroborating artifacts before report use.
+
+Dependency:
+    ccl-segb @ git+https://github.com/cclgroupltd/ccl-segb.git
+
+Example:
+    uv run python biome-parser "$HOME/Library/Biome/streams" --known-only > biome-known.tsv
+
+Version:
+    2026.05.01
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import struct
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+
+VERSION = "2026.05.01"
+
+DEFAULT_ROOTS = [
+    "~/Library/Biome/streams",
+    "/private/var/db/biome/streams",
+]
+
+MAC_ABSOLUTE_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
+PRINTABLE_RE = re.compile(rb"[\x20-\x7e]{4,}")
+
+RAW_FIELDNAMES = [
+    "source_file",
+    "stream_path",
+    "record_offset",
+    "metadata_offset",
+    "record_state",
+    "record_time_raw",
+    "record_time_utc",
+    "metadata_creation_raw",
+    "metadata_creation_utc",
+    "is_tombstone",
+    "payload_size",
+    "payload_sha256",
+    "payload_strings",
+    "payload_hex_preview",
+]
+
+SEMANTIC_FIELDNAMES = [
+    "source_file",
+    "stream_path",
+    "record_offset",
+    "metadata_offset",
+    "record_state",
+    "record_time_utc",
+    "metadata_creation_utc",
+    "is_tombstone",
+    "stream_family",
+    "semantic_event_type",
+    "event_time_raw",
+    "event_time_utc",
+    "bundle_id",
+    "network_ssid",
+    "app_version",
+    "app_build",
+    "activity_state",
+    "activity_state_raw",
+    "known_field_summary",
+    "payload_size",
+    "payload_sha256",
+    "payload_strings",
+    "payload_hex_preview",
+]
+
+BOTH_EXTRA_FIELDNAMES = [
+    "protobuf_top_level_json",
+]
+
+SUMMARY_FIELDNAMES = [
+    "stream_family",
+    "semantic_event_type",
+    "entity_id",
+    "bundle_id",
+    "network_ssid",
+    "start_state",
+    "stop_state",
+    "first_event_utc",
+    "last_event_utc",
+    "event_count",
+    "start_event_count",
+    "stop_event_count",
+    "interval_count",
+    "total_seconds",
+    "total_hhmmss",
+    "min_interval_seconds",
+    "max_interval_seconds",
+    "avg_interval_seconds",
+    "unmatched_start_count",
+    "unmatched_stop_count",
+    "repeated_start_count",
+    "source_file_count",
+    "stream_path_count",
+]
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def expand_path(path: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(path))).resolve()
+
+
+def safe_name(value: Any) -> str:
+    if value is None:
+        return ""
+    name = getattr(value, "name", None)
+    if name is not None:
+        return str(name)
+    return str(value)
+
+
+def raw_ts_string(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dt.datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def timestamp_to_utc(value: Any) -> str:
+    """
+    Best-effort timestamp conversion.
+
+    Common cases handled:
+      - datetime objects from ccl-segb
+      - Mac Absolute Time seconds, milliseconds, or nanoseconds
+      - Unix epoch seconds, milliseconds, or nanoseconds
+      - fixed64 double timestamps pulled from protobuf payloads
+
+    Returns blank when the value is absent or outside plausible ranges.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+
+    if number <= 0:
+        return ""
+
+    try:
+        # Nanoseconds since Unix epoch.
+        if 1_500_000_000_000_000_000 <= number <= 2_500_000_000_000_000_000:
+            converted = dt.datetime.fromtimestamp(number / 1_000_000_000, tz=dt.timezone.utc)
+            return converted.isoformat().replace("+00:00", "Z")
+
+        # Nanoseconds since Mac epoch.
+        if 600_000_000_000_000_000 <= number <= 1_300_000_000_000_000_000:
+            converted = MAC_ABSOLUTE_EPOCH + dt.timedelta(seconds=number / 1_000_000_000)
+            return converted.isoformat().replace("+00:00", "Z")
+
+        # Milliseconds since Unix epoch.
+        if 1_500_000_000_000 <= number <= 2_500_000_000_000:
+            converted = dt.datetime.fromtimestamp(number / 1000, tz=dt.timezone.utc)
+            return converted.isoformat().replace("+00:00", "Z")
+
+        # Milliseconds since Mac epoch.
+        if 600_000_000_000 <= number <= 1_300_000_000_000:
+            converted = MAC_ABSOLUTE_EPOCH + dt.timedelta(seconds=number / 1000)
+            return converted.isoformat().replace("+00:00", "Z")
+
+        # Seconds since Mac epoch. As of 2026, this is roughly 800M seconds.
+        if 600_000_000 <= number <= 1_300_000_000:
+            converted = MAC_ABSOLUTE_EPOCH + dt.timedelta(seconds=number)
+            return converted.isoformat().replace("+00:00", "Z")
+
+        # Seconds since Unix epoch.
+        if 1_300_000_000 < number <= 4_500_000_000:
+            converted = dt.datetime.fromtimestamp(number, tz=dt.timezone.utc)
+            return converted.isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+    return ""
+
+
+def nested_get(obj: Any, *attrs: str) -> Any:
+    cur = obj
+    for attr in attrs:
+        if cur is None:
+            return None
+        cur = getattr(cur, attr, None)
+    return cur
+
+
+def get_payload(record: Any) -> bytes:
+    data = getattr(record, "data", b"")
+    if data is None:
+        return b""
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, bytearray):
+        return bytes(data)
+    if isinstance(data, memoryview):
+        return data.tobytes()
+    return bytes(str(data), "utf-8", errors="replace")
+
+
+def extract_printable_strings(data: bytes, max_strings: int, max_string_len: int) -> str:
+    strings: list[str] = []
+    for match in PRINTABLE_RE.finditer(data):
+        text = match.group(0).decode("utf-8", errors="replace")
+        if len(text) > max_string_len:
+            text = text[:max_string_len] + "..."
+        strings.append(text)
+        if len(strings) >= max_strings:
+            break
+    return " | ".join(strings)
+
+
+@dataclass
+class ProtoField:
+    field_number: int
+    wire_type: int
+    start_offset: int
+    end_offset: int
+    raw_hex: str
+    value: Any = None
+    string_value: str = ""
+    fixed64_double: float | None = None
+    fixed64_uint: int | None = None
+    fixed32_uint: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "field": self.field_number,
+            "wire_type": self.wire_type,
+            "start": self.start_offset,
+            "end": self.end_offset,
+            "raw_hex": self.raw_hex,
+        }
+        if self.value is not None:
+            result["value"] = self.value
+        if self.string_value:
+            result["string"] = self.string_value
+        if self.fixed64_double is not None:
+            result["fixed64_double"] = self.fixed64_double
+            converted = timestamp_to_utc(self.fixed64_double)
+            if converted:
+                result["fixed64_time_utc_guess"] = converted
+        if self.fixed64_uint is not None:
+            result["fixed64_uint"] = self.fixed64_uint
+        if self.fixed32_uint is not None:
+            result["fixed32_uint"] = self.fixed32_uint
+        return result
+
+
+class ProtoDecodeError(Exception):
+    pass
+
+
+def read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    shift = 0
+    result = 0
+    pos = offset
+
+    while pos < len(data):
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 70:
+            raise ProtoDecodeError(f"varint too long at offset {offset}")
+
+    raise ProtoDecodeError(f"truncated varint at offset {offset}")
+
+
+def looks_like_utf8_text(raw: bytes) -> str:
+    if not raw:
+        return ""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+    # Keep common human-readable strings; reject control-heavy data.
+    printable = sum(1 for ch in text if ch == "\t" or ch == "\n" or (" " <= ch <= "~"))
+    if printable / max(len(text), 1) < 0.90:
+        return ""
+    return text
+
+
+def decode_protobuf_top_level(data: bytes) -> list[ProtoField]:
+    """
+    Decode top-level protobuf wire fields without a schema.
+
+    Supported wire types:
+      0 varint
+      1 fixed64
+      2 length-delimited
+      5 fixed32
+
+    Unsupported/deprecated wire types stop decoding and return fields parsed so far.
+    """
+    fields: list[ProtoField] = []
+    offset = 0
+
+    while offset < len(data):
+        field_start = offset
+        try:
+            key, offset = read_varint(data, offset)
+        except ProtoDecodeError:
+            break
+
+        field_number = key >> 3
+        wire_type = key & 0x07
+
+        if field_number <= 0:
+            break
+
+        try:
+            if wire_type == 0:
+                value, offset = read_varint(data, offset)
+                fields.append(
+                    ProtoField(
+                        field_number=field_number,
+                        wire_type=wire_type,
+                        start_offset=field_start,
+                        end_offset=offset,
+                        raw_hex=data[field_start:offset].hex(),
+                        value=value,
+                    )
+                )
+
+            elif wire_type == 1:
+                if offset + 8 > len(data):
+                    break
+                raw = data[offset : offset + 8]
+                offset += 8
+                fields.append(
+                    ProtoField(
+                        field_number=field_number,
+                        wire_type=wire_type,
+                        start_offset=field_start,
+                        end_offset=offset,
+                        raw_hex=data[field_start:offset].hex(),
+                        fixed64_uint=struct.unpack("<Q", raw)[0],
+                        fixed64_double=struct.unpack("<d", raw)[0],
+                    )
+                )
+
+            elif wire_type == 2:
+                length, offset = read_varint(data, offset)
+                if length < 0 or offset + length > len(data):
+                    break
+                raw = data[offset : offset + length]
+                offset += length
+                fields.append(
+                    ProtoField(
+                        field_number=field_number,
+                        wire_type=wire_type,
+                        start_offset=field_start,
+                        end_offset=offset,
+                        raw_hex=data[field_start:offset].hex(),
+                        value={"length": length},
+                        string_value=looks_like_utf8_text(raw),
+                    )
+                )
+
+            elif wire_type == 5:
+                if offset + 4 > len(data):
+                    break
+                raw = data[offset : offset + 4]
+                offset += 4
+                fields.append(
+                    ProtoField(
+                        field_number=field_number,
+                        wire_type=wire_type,
+                        start_offset=field_start,
+                        end_offset=offset,
+                        raw_hex=data[field_start:offset].hex(),
+                        fixed32_uint=struct.unpack("<I", raw)[0],
+                    )
+                )
+
+            else:
+                break
+
+        except ProtoDecodeError:
+            break
+
+    return fields
+
+
+def fields_by_number(fields: list[ProtoField]) -> dict[int, list[ProtoField]]:
+    grouped: dict[int, list[ProtoField]] = {}
+    for field in fields:
+        grouped.setdefault(field.field_number, []).append(field)
+    return grouped
+
+
+def first_varint(grouped: dict[int, list[ProtoField]], field_number: int) -> int | None:
+    for field in grouped.get(field_number, []):
+        if field.wire_type == 0 and isinstance(field.value, int):
+            return field.value
+    return None
+
+
+def first_string(grouped: dict[int, list[ProtoField]], field_number: int) -> str:
+    for field in grouped.get(field_number, []):
+        if field.wire_type == 2 and field.string_value:
+            return field.string_value
+    return ""
+
+
+def first_fixed64_double(grouped: dict[int, list[ProtoField]], field_number: int) -> float | None:
+    for field in grouped.get(field_number, []):
+        if field.wire_type == 1 and field.fixed64_double is not None:
+            return field.fixed64_double
+    return None
+
+
+def summarize_known_fields(grouped: dict[int, list[ProtoField]], wanted: list[int]) -> str:
+    parts: list[str] = []
+    for field_number in wanted:
+        values: list[str] = []
+        for field in grouped.get(field_number, []):
+            if field.wire_type == 0 and field.value is not None:
+                values.append(str(field.value))
+            elif field.wire_type == 1 and field.fixed64_double is not None:
+                values.append(str(field.fixed64_double))
+            elif field.wire_type == 2 and field.string_value:
+                values.append(field.string_value)
+            elif field.wire_type == 5 and field.fixed32_uint is not None:
+                values.append(str(field.fixed32_uint))
+        if values:
+            parts.append(f"f{field_number}=" + ",".join(values))
+    return "; ".join(parts)
+
+
+def decode_app_infocus(fields: list[ProtoField]) -> dict[str, str]:
+    """
+    Targeted extraction for restricted/App.InFocus records.
+
+    Observed layout on current macOS output:
+      field 2: varint, usually 1
+      field 3: varint focus flag: 1 focused, 0 unfocused
+      field 4: fixed64 double, Mac Absolute Time seconds
+      field 6: bundle ID
+      field 9: app version
+      field 10: app build
+    """
+    grouped = fields_by_number(fields)
+    focus_flag = first_varint(grouped, 3)
+    event_time = first_fixed64_double(grouped, 4)
+
+    if focus_flag == 1:
+        activity_state = "focused"
+    elif focus_flag == 0:
+        activity_state = "unfocused"
+    else:
+        activity_state = ""
+
+    return {
+        "stream_family": "App.InFocus",
+        "semantic_event_type": "app_focus",
+        "event_time_raw": "" if event_time is None else str(event_time),
+        "event_time_utc": timestamp_to_utc(event_time),
+        "bundle_id": first_string(grouped, 6),
+        "network_ssid": "",
+        "app_version": first_string(grouped, 9),
+        "app_build": first_string(grouped, 10),
+        "activity_state": activity_state,
+        "activity_state_raw": "" if focus_flag is None else str(focus_flag),
+        "known_field_summary": summarize_known_fields(grouped, [2, 3, 4, 6, 9, 10, 11, 12, 13]),
+    }
+
+
+def decode_screentime_appusage(fields: list[ProtoField]) -> dict[str, str]:
+    """
+    Targeted extraction for restricted/ScreenTime.AppUsage records.
+
+    Observed layout on current macOS output:
+      field 1: varint usage flag: 1 active, 0 inactive
+      field 2: fixed64 double, Unix epoch seconds
+      field 3: bundle ID
+      field 5: varint, observed as 1 in sample output
+    """
+    grouped = fields_by_number(fields)
+    usage_flag = first_varint(grouped, 1)
+    event_time = first_fixed64_double(grouped, 2)
+
+    if usage_flag == 1:
+        activity_state = "active"
+    elif usage_flag == 0:
+        activity_state = "inactive"
+    else:
+        activity_state = ""
+
+    return {
+        "stream_family": "ScreenTime.AppUsage",
+        "semantic_event_type": "app_usage",
+        "event_time_raw": "" if event_time is None else str(event_time),
+        "event_time_utc": timestamp_to_utc(event_time),
+        "bundle_id": first_string(fields_by_number(fields), 3),
+        "network_ssid": "",
+        "app_version": "",
+        "app_build": "",
+        "activity_state": activity_state,
+        "activity_state_raw": "" if usage_flag is None else str(usage_flag),
+        "known_field_summary": summarize_known_fields(grouped, [1, 2, 3, 5]),
+    }
+
+
+def decode_device_wireless_wifi(fields: list[ProtoField]) -> dict[str, str]:
+    grouped = fields_by_number(fields)
+    ssid = first_string(grouped, 1)
+    enabled_flag = first_varint(grouped, 2)
+    if enabled_flag == 1:
+        activity_state = "connected_or_enabled"
+    elif enabled_flag == 0:
+        activity_state = "disconnected_or_disabled"
+    else:
+        activity_state = ""
+    return {
+        "stream_family": "Device.Wireless.WiFi",
+        "semantic_event_type": "wifi_state",
+        "event_time_raw": "",
+        "event_time_utc": "",
+        "bundle_id": "",
+        "network_ssid": ssid,
+        "app_version": "",
+        "app_build": "",
+        "activity_state": activity_state,
+        "activity_state_raw": "" if enabled_flag is None else str(enabled_flag),
+        "known_field_summary": summarize_known_fields(grouped, [1, 2]) + (f"; ssid={ssid}" if ssid else ""),
+    }
+
+
+def semantic_decode(stream_path: str, payload: bytes, fields: list[ProtoField]) -> dict[str, str]:
+    normalized = stream_path.replace("\\", "/")
+
+    empty = {
+        "stream_family": "",
+        "semantic_event_type": "",
+        "event_time_raw": "",
+        "event_time_utc": "",
+        "bundle_id": "",
+        "network_ssid": "",
+        "app_version": "",
+        "app_build": "",
+        "activity_state": "",
+        "activity_state_raw": "",
+        "known_field_summary": "",
+    }
+
+    if "/App.InFocus/" in f"/{normalized}":
+        return decode_app_infocus(fields)
+
+    if "/ScreenTime.AppUsage/" in f"/{normalized}":
+        return decode_screentime_appusage(fields)
+
+    if "/Device.Wireless.WiFi/" in f"/{normalized}":
+        return decode_device_wireless_wifi(fields)
+
+    return empty
+
+
+def iter_candidate_files(root: Path) -> Iterator[Path]:
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+
+        lowered = path.name.lower()
+        if lowered.endswith((".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".plist")):
+            continue
+
+        yield path
+
+
+def stream_relative_path(root: Path, path: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def is_tombstone_path(path_text: str) -> bool:
+    return "/tombstone/" in path_text.replace("\\", "/")
+
+
+def base_record_row(
+    *,
+    path: Path,
+    root: Path,
+    record: Any,
+    payload: bytes,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    stream_path = stream_relative_path(root, path)
+
+    timestamp1 = getattr(record, "timestamp1", None)
+    metadata_creation = nested_get(record, "metadata", "creation")
+    metadata_offset = nested_get(record, "metadata", "metadata_offset")
+    metadata_state = nested_get(record, "metadata", "state")
+
+    state = getattr(record, "state", None)
+    if state is None:
+        state = metadata_state
+
+    offset = getattr(record, "data_start_offset", None)
+    payload_sha256 = hashlib.sha256(payload).hexdigest() if payload else ""
+
+    return {
+        "source_file": str(path),
+        "stream_path": stream_path,
+        "record_offset": "" if offset is None else str(offset),
+        "metadata_offset": "" if metadata_offset is None else str(metadata_offset),
+        "record_state": safe_name(state),
+        "record_time_raw": raw_ts_string(timestamp1),
+        "record_time_utc": timestamp_to_utc(timestamp1),
+        "metadata_creation_raw": raw_ts_string(metadata_creation),
+        "metadata_creation_utc": timestamp_to_utc(metadata_creation),
+        "is_tombstone": "YES" if is_tombstone_path(stream_path) else "NO",
+        "payload_size": len(payload),
+        "payload_sha256": payload_sha256,
+        "payload_strings": extract_printable_strings(
+            payload,
+            max_strings=args.max_strings,
+            max_string_len=args.max_string_len,
+        ),
+        "payload_hex_preview": payload[: args.hex_bytes].hex() if args.hex_bytes > 0 else "",
+    }
+
+
+def parse_file(path: Path, root: Path, args: argparse.Namespace) -> Iterable[dict[str, Any]]:
+    import ccl_segb  # type: ignore
+
+    try:
+        records = ccl_segb.read_segb_file(str(path))
+    except Exception as exc:
+        if args.verbose:
+            eprint(f"[skip] {path}: {exc}")
+        return
+
+    count = 0
+
+    try:
+        for record in records:
+            payload = get_payload(record)
+            stream_path = stream_relative_path(root, path)
+
+            if args.skip_tombstones and is_tombstone_path(stream_path):
+                continue
+
+            if not args.include_empty and payload and set(payload) == {0}:
+                continue
+
+            fields = decode_protobuf_top_level(payload)
+            row = base_record_row(path=path, root=root, record=record, payload=payload, args=args)
+            semantic = semantic_decode(stream_path, payload, fields)
+
+            if semantic.get("stream_family") == "Device.Wireless.WiFi" and not semantic.get("event_time_utc"):
+                semantic["event_time_raw"] = row.get("record_time_raw", "")
+                semantic["event_time_utc"] = row.get("record_time_utc", "")
+
+            if args.known_only and not semantic.get("stream_family"):
+                continue
+
+            row.update(semantic)
+
+            if args.mode == "both":
+                row["protobuf_top_level_json"] = json.dumps(
+                    [field.to_dict() for field in fields],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+
+            yield row
+
+            count += 1
+            if args.limit and count >= args.limit:
+                break
+
+    except Exception as exc:
+        if args.verbose:
+            eprint(f"[error] {path}: {exc}")
+
+
+def fieldnames_for_mode(mode: str) -> list[str]:
+    if mode == "raw":
+        return RAW_FIELDNAMES
+    if mode == "semantic":
+        return SEMANTIC_FIELDNAMES
+    return SEMANTIC_FIELDNAMES + BOTH_EXTRA_FIELDNAMES
+
+
+def write_tsv(rows: Iterable[dict[str, Any]], fieldnames: list[str]) -> None:
+    writer = csv.DictWriter(
+        sys.stdout,
+        fieldnames=fieldnames,
+        delimiter="\t",
+        lineterminator="\n",
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+
+    for row in rows:
+        writer.writerow(row)
+
+
+def write_jsonl(rows: Iterable[dict[str, Any]], fieldnames: list[str]) -> None:
+    for row in rows:
+        trimmed = {key: row.get(key, "") for key in fieldnames}
+        print(json.dumps(trimmed, ensure_ascii=False, default=str))
+
+
+
+def parse_utc_datetime(value: Any) -> dt.datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def seconds_to_hhmmss(seconds: float) -> str:
+    total = int(round(seconds))
+    sign = "-" if total < 0 else ""
+    total = abs(total)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def interval_states_for_row(row: dict[str, Any]) -> tuple[str, str] | None:
+    stream_family = str(row.get("stream_family", ""))
+    event_type = str(row.get("semantic_event_type", ""))
+
+    if stream_family == "ScreenTime.AppUsage" and event_type == "app_usage":
+        return "active", "inactive"
+
+    if stream_family == "App.InFocus" and event_type == "app_focus":
+        return "focused", "unfocused"
+
+    if stream_family == "Device.Wireless.WiFi" and event_type == "wifi_state":
+        return "connected_or_enabled", "disconnected_or_disabled"
+
+    return None
+
+
+def entity_id_for_row(row: dict[str, Any]) -> str:
+    bundle_id = str(row.get("bundle_id", "")).strip()
+    if bundle_id:
+        return bundle_id
+
+    network_ssid = str(row.get("network_ssid", "")).strip()
+    if network_ssid:
+        return network_ssid
+
+    return str(row.get("stream_family", "")).strip() or "UNKNOWN"
+
+
+def summarize_intervals(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for row in rows:
+        states = interval_states_for_row(row)
+        if states is None:
+            continue
+
+        event_time_text = str(row.get("event_time_utc", "")).strip() or str(row.get("record_time_utc", "")).strip()
+        event_time = parse_utc_datetime(event_time_text)
+        if event_time is None:
+            continue
+
+        start_state, stop_state = states
+        state = str(row.get("activity_state", "")).strip()
+        if state not in {start_state, stop_state}:
+            continue
+
+        stream_family = str(row.get("stream_family", "")).strip()
+        event_type = str(row.get("semantic_event_type", "")).strip()
+        entity_id = entity_id_for_row(row)
+        key = (stream_family, event_type, entity_id)
+
+        group = groups.setdefault(
+            key,
+            {
+                "stream_family": stream_family,
+                "semantic_event_type": event_type,
+                "entity_id": entity_id,
+                "bundle_id": str(row.get("bundle_id", "")).strip(),
+                "network_ssid": str(row.get("network_ssid", "")).strip(),
+                "start_state": start_state,
+                "stop_state": stop_state,
+                "events": [],
+                "source_files": set(),
+                "stream_paths": set(),
+            },
+        )
+
+        if not group.get("bundle_id") and str(row.get("bundle_id", "")).strip():
+            group["bundle_id"] = str(row.get("bundle_id", "")).strip()
+        if not group.get("network_ssid") and str(row.get("network_ssid", "")).strip():
+            group["network_ssid"] = str(row.get("network_ssid", "")).strip()
+
+        group["events"].append((event_time, state))
+        if row.get("source_file"):
+            group["source_files"].add(str(row.get("source_file")))
+        if row.get("stream_path"):
+            group["stream_paths"].add(str(row.get("stream_path")))
+
+    summary_rows: list[dict[str, Any]] = []
+
+    for group in groups.values():
+        events = sorted(group["events"], key=lambda item: item[0])
+        if not events:
+            continue
+
+        open_start: dt.datetime | None = None
+        intervals: list[float] = []
+        start_count = 0
+        stop_count = 0
+        unmatched_stop_count = 0
+        repeated_start_count = 0
+
+        for event_time, state in events:
+            if state == group["start_state"]:
+                start_count += 1
+                if open_start is None:
+                    open_start = event_time
+                else:
+                    # Do not reset the existing interval. Treat repeated starts as noise/duplicates.
+                    repeated_start_count += 1
+            elif state == group["stop_state"]:
+                stop_count += 1
+                if open_start is None:
+                    unmatched_stop_count += 1
+                    continue
+                duration = (event_time - open_start).total_seconds()
+                if duration >= 0:
+                    intervals.append(duration)
+                else:
+                    unmatched_stop_count += 1
+                open_start = None
+
+        unmatched_start_count = 1 if open_start is not None else 0
+        total_seconds = sum(intervals)
+        min_interval = min(intervals) if intervals else 0.0
+        max_interval = max(intervals) if intervals else 0.0
+        avg_interval = total_seconds / len(intervals) if intervals else 0.0
+
+        summary_rows.append(
+            {
+                "stream_family": group["stream_family"],
+                "semantic_event_type": group["semantic_event_type"],
+                "entity_id": group["entity_id"],
+                "bundle_id": group.get("bundle_id", ""),
+                "network_ssid": group.get("network_ssid", ""),
+                "start_state": group["start_state"],
+                "stop_state": group["stop_state"],
+                "first_event_utc": events[0][0].isoformat().replace("+00:00", "Z"),
+                "last_event_utc": events[-1][0].isoformat().replace("+00:00", "Z"),
+                "event_count": len(events),
+                "start_event_count": start_count,
+                "stop_event_count": stop_count,
+                "interval_count": len(intervals),
+                "total_seconds": f"{total_seconds:.3f}",
+                "total_hhmmss": seconds_to_hhmmss(total_seconds),
+                "min_interval_seconds": f"{min_interval:.3f}",
+                "max_interval_seconds": f"{max_interval:.3f}",
+                "avg_interval_seconds": f"{avg_interval:.3f}",
+                "unmatched_start_count": unmatched_start_count,
+                "unmatched_stop_count": unmatched_stop_count,
+                "repeated_start_count": repeated_start_count,
+                "source_file_count": len(group["source_files"]),
+                "stream_path_count": len(group["stream_paths"]),
+            }
+        )
+
+    return sorted(
+        summary_rows,
+        key=lambda row: (
+            -float(row["total_seconds"]),
+            str(row["stream_family"]),
+            str(row["entity_id"]),
+        ),
+    )
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Dump and partially decode Apple Biome SEGB stream records.",
+    )
+
+    parser.add_argument(
+        "roots",
+        nargs="*",
+        help=(
+            "Biome stream root(s) or individual SEGB files. "
+            "Default: ~/Library/Biome/streams"
+        ),
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["raw", "semantic", "both"],
+        default="semantic",
+        help=(
+            "Output mode. raw output; semantic adds decoded columns; "
+            "both adds protobuf_top_level_json. Default: semantic."
+        ),
+    )
+
+    parser.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="Produces JSONL instead of TSV.",
+    )
+
+    parser.add_argument(
+        "--interval-summary",
+        action="store_true",
+        help=(
+            "Output one summary row per decoded entity by pairing start/stop events. "
+            "Currently summarizes ScreenTime.AppUsage active/inactive, "
+            "App.InFocus focused/unfocused, and Device.Wireless.WiFi connected/disconnected states."
+        ),
+    )
+
+    parser.add_argument(
+        "--known-only",
+        action="store_true",
+        help=(
+            "Only emit records from streams with targeted semantic decoding "
+            "currently implemented: App.InFocus, ScreenTime.AppUsage, Device.Wireless.WiFi."
+        ),
+    )
+
+    parser.add_argument(
+        "--skip-tombstones",
+        action="store_true",
+        help="Skip paths containing /tombstone/.",
+    )
+
+    parser.add_argument(
+        "--include-empty",
+        action="store_true",
+        help="Include records whose payload is all null bytes.",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum records per file. Default: 0, no limit.",
+    )
+
+    parser.add_argument(
+        "--max-strings",
+        type=int,
+        default=25,
+        help="Maximum printable strings to extract per payload. Default: 25.",
+    )
+
+    parser.add_argument(
+        "--max-string-len",
+        type=int,
+        default=200,
+        help="Maximum length of each extracted string. Default: 200.",
+    )
+
+    parser.add_argument(
+        "--hex-bytes",
+        type=int,
+        default=64,
+        help="Number of payload bytes to include as hex preview. Default: 64. Use 0 to disable.",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print skipped files and parse errors to stderr.",
+    )
+
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+
+    return parser
+
+
+def iter_all_rows(args: argparse.Namespace) -> Iterable[dict[str, Any]]:
+    input_paths = args.roots or [DEFAULT_ROOTS[0]]
+    expanded_paths = [expand_path(p) for p in input_paths]
+
+    for root in expanded_paths:
+        if not root.exists():
+            eprint(f"[missing] {root}")
+            continue
+
+        if root.is_file():
+            yield from parse_file(root, root.parent, args)
+            continue
+
+        for candidate in iter_candidate_files(root):
+            yield from parse_file(candidate, root, args)
+
+
+def main() -> int:
+    parser = build_argparser()
+    args = parser.parse_args()
+
+    rows = iter_all_rows(args)
+
+    if args.interval_summary:
+        fieldnames = SUMMARY_FIELDNAMES
+        summary_rows = summarize_intervals(rows)
+        if args.jsonl:
+            write_jsonl(summary_rows, fieldnames)
+        else:
+            write_tsv(summary_rows, fieldnames)
+        return 0
+
+    fieldnames = fieldnames_for_mode(args.mode)
+
+    if args.jsonl:
+        write_jsonl(rows, fieldnames)
+    else:
+        write_tsv(rows, fieldnames)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
